@@ -19,10 +19,208 @@ jobs:
           git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
           git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
 
-      - name: Fix Host DTC & Integrate KernelSU-Next
+      - name: Integrate KernelSU-Next & Manual Hooks
         run: |
           sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c_shipped || true
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+          cat << 'EOF' > patch_ksu.py
+          import os, re
+
+          def read_file(path):
+              with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                  return f.read()
+
+          def write_file(path, content):
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+
+          # 1. fs/exec.c
+          p = 'fs/exec.c'
+          s = read_file(p)
+          if 'ksu_handle_execveat' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern bool ksu_execveat_hook __read_mostly;
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+          			void *envp, int *flags);
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+          				 void *argv, void *envp, int *flags);
+          #endif
+          static int do_execveat_common('''
+              s = s.replace('static int do_execveat_common(', decl, 1)
+              hook = '''	if (IS_ERR(filename))
+          		return PTR_ERR(filename);
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_execveat_hook))
+          		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+          	else
+          		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+          #endif'''
+              s = s.replace('	if (IS_ERR(filename))\n		return PTR_ERR(filename);', hook, 1)
+              write_file(p, s)
+              print('Patched fs/exec.c')
+
+          # 2. fs/open.c
+          p = 'fs/open.c'
+          s = read_file(p)
+          if 'ksu_handle_faccessat' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+          			 int *flags);
+          #endif
+          SYSCALL_DEFINE3(faccessat'''
+              s = s.replace('SYSCALL_DEFINE3(faccessat', decl, 1)
+              hook = '''#ifdef CONFIG_KSU
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          	if (mode & ~S_IRWXO)'''
+              s = s.replace('	if (mode & ~S_IRWXO)', hook, 1)
+              write_file(p, s)
+              print('Patched fs/open.c')
+
+          # 3. fs/read_write.c
+          p = 'fs/read_write.c'
+          s = read_file(p)
+          if 'ksu_handle_vfs_read' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+          			size_t *count_ptr, loff_t **pos);
+          #endif
+          ssize_t vfs_read('''
+              s = s.replace('ssize_t vfs_read(', decl, 1)
+              hook = '''#ifdef CONFIG_KSU
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_vfs_read(&file, &buf, &count, &pos);
+          #endif
+          	if (!(file->f_mode & FMODE_READ))'''
+              s = s.replace('	if (!(file->f_mode & FMODE_READ))', hook, 1)
+              write_file(p, s)
+              print('Patched fs/read_write.c')
+
+          # 4. fs/stat.c
+          p = 'fs/stat.c'
+          s = read_file(p)
+          if 'ksu_handle_stat' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          #endif
+          int vfs_fstatat('''
+              if 'int vfs_fstatat(' in s:
+                  s = s.replace('int vfs_fstatat(', decl, 1)
+                  s = re.sub(r'(int vfs_fstatat\([^)]+\)\s*\{)', r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif', s, count=1)
+              elif 'int vfs_statx(' in s:
+                  s = s.replace('int vfs_statx(', decl.replace('int vfs_fstatat(', 'int vfs_statx('), 1)
+                  s = re.sub(r'(int vfs_statx\([^)]+\)\s*\{)', r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif', s, count=1)
+              write_file(p, s)
+              print('Patched fs/stat.c')
+
+          # 5. drivers/input/input.c
+          p = 'drivers/input/input.c'
+          s = read_file(p)
+          if 'ksu_handle_input_handle_event' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern bool ksu_input_hook __read_mostly;
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          #endif
+          void input_event('''
+              s = s.replace('void input_event(', decl, 1)
+              hook = '''	if (is_event_supported(type, dev->evbit, EV_MAX)) {
+          #ifdef CONFIG_KSU
+          		if (unlikely(ksu_input_hook))
+          			ksu_handle_input_handle_event(&type, &code, &value);
+          #endif'''
+              s = s.replace('	if (is_event_supported(type, dev->evbit, EV_MAX)) {', hook, 1)
+              write_file(p, s)
+              print('Patched drivers/input/input.c')
+
+          # 6. kernel/reboot.c
+          p = 'kernel/reboot.c'
+          s = read_file(p)
+          if 'ksu_handle_sys_reboot' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          #endif
+          SYSCALL_DEFINE4(reboot'''
+              s = s.replace('SYSCALL_DEFINE4(reboot', decl, 1)
+              s = re.sub(r'(SYSCALL_DEFINE4\(reboot[^)]+\)\s*\{)', r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif', s, count=1)
+              write_file(p, s)
+              print('Patched kernel/reboot.c')
+
+          # 7. kernel/sys.c
+          ksu_src = ''
+          for root, _, files in os.walk('drivers/kernelsu'):
+              for fn in files:
+                  if fn.endswith(('.c', '.h')):
+                      ksu_src += read_file(os.path.join(root, fn))
+
+          p = 'kernel/sys.c'
+          s = read_file(p)
+          if 'ksu_handle_setresuid' in ksu_src and 'ksu_handle_setresuid' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+          #endif
+          SYSCALL_DEFINE3(setresuid'''
+              if 'SYSCALL_DEFINE3(setresuid' in s:
+                  s = s.replace('SYSCALL_DEFINE3(setresuid', decl, 1)
+                  s = re.sub(r'(SYSCALL_DEFINE3\(setresuid[^)]+\)\s*\{)', r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif', s, count=1)
+                  write_file(p, s)
+                  print('Patched kernel/sys.c (setresuid)')
+          elif 'ksu_handle_setuid' in ksu_src and 'ksu_handle_setuid' not in s:
+              decl = '''#ifdef CONFIG_KSU
+          extern int ksu_handle_setuid(uid_t new_uid, uid_t old_uid);
+          #endif
+          SYSCALL_DEFINE1(setuid'''
+              if 'SYSCALL_DEFINE1(setuid' in s:
+                  s = s.replace('SYSCALL_DEFINE1(setuid', decl, 1)
+                  s = re.sub(r'(SYSCALL_DEFINE1\(setuid[^)]+\)\s*\{)', r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_setuid(uid, current_uid().val);\n#endif', s, count=1)
+                  write_file(p, s)
+                  print('Patched kernel/sys.c (setuid)')
+
+          # 8. fs/namespace.c (path_umount backport for Linux 4.9)
+          p = 'fs/namespace.c'
+          s = read_file(p)
+          if 'int path_umount(' not in s and 'SYSCALL_DEFINE2(umount' in s:
+              umount_fn = '''static int can_umount(const struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+
+          	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+          		return -EINVAL;
+          	if (!may_mount())
+          		return -EPERM;
+          	if (path->dentry != path->mnt->mnt_root)
+          		return -EINVAL;
+          	if (!check_mnt(mnt))
+          		return -EINVAL;
+          	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+          		return -EINVAL;
+          	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          		return -EPERM;
+          	return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+          	int ret;
+
+          	ret = can_umount(path, flags);
+          	if (!ret)
+          		ret = do_umount(mnt, flags);
+
+          	dput(path->dentry);
+          	mntput_no_expire(mnt);
+          	return ret;
+          }
+
+          SYSCALL_DEFINE2(umount'''
+              s = s.replace('SYSCALL_DEFINE2(umount', umount_fn, 1)
+              write_file(p, s)
+              print('Patched fs/namespace.c (path_umount)')
+          EOF
+          python3 patch_ksu.py
+
           if [ -f "arch/arm64/configs/onclite-perf_defconfig" ]; then
             DEFCONFIG="onclite-perf_defconfig"
           else
@@ -30,6 +228,9 @@ jobs:
           fi
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
           echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
+          if grep -q "KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig; then
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/$DEFCONFIG
+          fi
 
       - name: Compile Kernel and WLAN Module
         run: |
