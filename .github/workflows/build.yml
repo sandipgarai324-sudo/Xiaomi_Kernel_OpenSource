@@ -1,0 +1,60 @@
+name: Build MIUI Android 10 KSU-Next
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout onc-q-oss Source
+        uses: actions/checkout@v4
+        with:
+          depth: 1
+
+      - name: Install Build Dependencies & GCC 4.9
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf libncurses5-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python2
+          git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
+          git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
+
+      - name: Fix Host DTC & Integrate KernelSU-Next
+        run: |
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c_shipped || true
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          if [ -f "arch/arm64/configs/onclite-perf_defconfig" ]; then
+            DEFCONFIG="onclite-perf_defconfig"
+          else
+            DEFCONFIG="onc-perf_defconfig"
+          fi
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
+
+      - name: Compile Kernel and WLAN Module
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          make O=out $DEFCONFIG
+          make -j$(nproc) O=out KCFLAGS="-Wno-error"
+
+      - name: Package AnyKernel3 with wlan.ko
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          mkdir -p AnyKernel3/modules/vendor/lib/modules
+          WLAN_MOD=$(find out -name "wlan.ko" | head -n 1)
+          ./gcc64/bin/aarch64-linux-android-strip --strip-unneeded "$WLAN_MOD"
+          cp "$WLAN_MOD" AnyKernel3/modules/vendor/lib/modules/wlan.ko
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          cd AnyKernel3 && zip -r9 ../Redmi7-MIUI10-KSUNext.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Redmi7-MIUI10-KSUNext
+          path: Redmi7-MIUI10-KSUNext.zip
+          
